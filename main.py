@@ -96,6 +96,7 @@ class Store:
 store = Store(DATA_FILE)
 RUNNING = {}      # id progetto -> ChildBot
 COOLDOWNS = {}    # (pid, comando, utente) -> timestamp
+BG = set()        # riferimenti ai task in background (evita che vengano raccolti dal GC)
 
 def is_admin(uid): return uid in OWNER_IDS or uid in store.d["admins"]
 
@@ -300,6 +301,18 @@ def generic_cmd(pid):
                 if x["enabled"] and x["type"] != "contestuale" and current.lower() in n][:25]
     c.autocomplete("nome")(ac); return c
 
+# FIX 1: funzioni "fabbrica". Prima il valore di n veniva passato come parametro di default (n=n):
+# discord.py legge la firma e lo considera un'opzione del comando (slash) o rifiuta il callback (menu contestuale).
+def make_slash(pid, n, desc):
+    async def scb(inter: discord.Interaction):
+        await run_custom(inter, pid, n)
+    return app_commands.Command(name=n, description=(desc or "Comando")[:100], callback=scb)
+
+def make_ctx(pid, n):
+    async def ccb(inter: discord.Interaction, member: discord.Member):
+        await run_custom(inter, pid, n, target=member)
+    return app_commands.ContextMenu(name=n[:32], callback=ccb)
+
 def mod_commands():
     out = []
     def hier(inter, m): return inter.guild.owner_id == inter.user.id or m.top_role < inter.user.top_role
@@ -348,6 +361,11 @@ class ChildBot(discord.Client):
         await self.rebuild_tree()
         self.sched_task = asyncio.create_task(self.scheduler())
 
+    # FIX 3: cancella sempre lo scheduler quando il client viene chiuso (anche nei tentativi di avvio falliti)
+    async def close(self):
+        if self.sched_task: self.sched_task.cancel()
+        await super().close()
+
     async def rebuild_tree(self):
         p = self.p; guild = discord.Object(int(p["guild_id"])) if p.get("guild_id") else None
         self.tree.clear_commands(guild=guild)
@@ -359,11 +377,9 @@ class ChildBot(discord.Client):
             if not c["enabled"]: continue
             if c["type"] == "contestuale":
                 if ctx >= 5: continue
-                async def ccb(inter: discord.Interaction, member: discord.Member, n=n): await run_custom(inter, self.pid, n, target=member)
-                self.tree.add_command(app_commands.ContextMenu(name=n[:32], callback=ccb), guild=guild); ctx += 1
+                self.tree.add_command(make_ctx(self.pid, n), guild=guild); ctx += 1
             elif slash < TOP_LEVEL_SLASH:
-                async def scb(inter: discord.Interaction, n=n): await run_custom(inter, self.pid, n)
-                self.tree.add_command(app_commands.Command(name=n, description=c["description"][:100] or "Comando", callback=scb), guild=guild); slash += 1
+                self.tree.add_command(make_slash(self.pid, n, c["description"]), guild=guild); slash += 1
         await self.tree.sync(guild=guild)
 
     async def on_tree_error(self, inter, error):
@@ -523,12 +539,18 @@ async def stop_child(p):
         await c.close()
     p["status"] = "offline"; store.save()
 
+# FIX 2: il sync dei comandi con Discord avviene in background. Prima si aspettava il sync prima di
+# rispondere all'utente: oltre i 3 secondi l'interazione scadeva ("l'applicazione non ha risposto").
+async def _resync(c, pid):
+    try: await c.rebuild_tree()
+    except Exception as e: record_error(pid, "sync", "-", e)
+
 async def commit(p, reload=False):
     p["updated"] = now(); store.save()
     c = RUNNING.get(p["id"])
     if reload and c:
-        try: await c.rebuild_tree()
-        except Exception as e: record_error(p["id"], "sync", "-", e)
+        t = asyncio.create_task(_resync(c, p["id"]))
+        BG.add(t); t.add_done_callback(BG.discard)
 
 async def child_send(p, channel_id, **kw):
     c = RUNNING.get(p["id"])
@@ -570,7 +592,8 @@ class Manager(discord.Client):
         if DEV_GUILD_ID:
             g = discord.Object(DEV_GUILD_ID); self.tree.copy_global_to(guild=g); await self.tree.sync(guild=g)
         else: await self.tree.sync()
-        asyncio.create_task(self.autosave()); asyncio.create_task(self.restore())
+        for coro in (self.autosave(), self.restore()):
+            t = asyncio.create_task(coro); BG.add(t); t.add_done_callback(BG.discard)
     async def autosave(self):
         while True:
             await asyncio.sleep(15)
@@ -692,7 +715,10 @@ async def metti_online(inter: discord.Interaction, bot: str):
     p = await get_p(inter, bot)
     if not p: return
     await inter.response.defer(ephemeral=True)
-    if not await fetch_bot_info(dec(p["token"])): return await inter.followup.send("❌ Token rifiutato da Discord: reimpostalo con /configura-bot.", ephemeral=True)
+    # FIX 4: la decifratura del token ora è protetta (BOTFORGE_KEY errata/cambiata non lascia più il comando senza risposta)
+    try: tok = dec(p["token"])
+    except Exception: return await inter.followup.send("❌ Token non leggibile: reimpostalo con /configura-bot o controlla BOTFORGE_KEY.", ephemeral=True)
+    if not await fetch_bot_info(tok): return await inter.followup.send("❌ Token rifiutato da Discord: reimpostalo con /configura-bot.", ephemeral=True)
     err = await start_child(p)
     if err: return await inter.followup.send(f"❌ Non pubblicato: {err}", ephemeral=True)
     bad = [t for ok, t in await run_checks(p) if not ok]
@@ -968,7 +994,7 @@ async def prova_comando(inter: discord.Interaction, bot: str, comando: str):
     pr = validate_command(c, guild_of(p))
     if pr: return await send(inter, f"❌ Test fallito per `/{c['name']}`:\n" + "\n".join(f"• {x}" for x in pr) + "\n\nCorreggi con /modifica-comando.", ephemeral=True)
     content, embed = build_message(p, c["response"], make_fmt(inter, {f: f"<{f}>" for f in c["fields"]}))
-    await send(inter, f"✅ Test superato: campi, segnaposto, permessi e azioni sono validi. Anteprima:" + ("\n⚠️ Il comando è disattivato." if not c["enabled"] else ""), ephemeral=True)
+    await send(inter, "✅ Test superato: campi, segnaposto, permessi e azioni sono validi. Anteprima:" + ("\n⚠️ Il comando è disattivato." if not c["enabled"] else ""), ephemeral=True)
     await send(inter, content, embed=embed, ephemeral=True)
 
 # ===== 3. TEMPLATE, SALVATAGGI, TRASFERIMENTO =====
@@ -1416,5 +1442,8 @@ async def accessi(inter: discord.Interaction, azione: str, utente: discord.User 
 
 if __name__ == "__main__":
     if not TOKEN: sys.exit("Imposta la variabile d'ambiente DISCORD_TOKEN.")
+    if Fernet and SECRET_KEY:
+        try: Fernet(SECRET_KEY.encode())
+        except Exception: sys.exit("BOTFORGE_KEY non valida: deve essere una chiave Fernet (vedi il comando di generazione in cima al file).")
     if not (Fernet and SECRET_KEY): print("⚠️  BOTFORGE_KEY non impostata: i token dei bot verranno salvati in chiaro.")
     manager.run(TOKEN)
