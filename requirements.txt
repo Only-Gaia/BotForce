@@ -1,4 +1,4 @@
-discord.py>=2.4
-aiohttp
-tzdata
-cryptography
+   discord.py>=2.4
+   aiohttp
+   tzdata
+   cryptography
