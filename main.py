@@ -12,8 +12,9 @@ Avvio:
 Variabili opzionali: DEV_GUILD_ID (sync immediato dei comandi in un server),
 SUPPORT_CHANNEL_ID, DATA_FILE, MAX_RUNNING_BOTS.
 
-Architettura: il bot "manager" espone i 41 comandi slash. Ogni bot creato dagli
+Architettura: il bot "manager" espone i 42 comandi slash. Ogni bot creato dagli
 utenti gira come client discord.py separato nello stesso processo (hosting integrato).
+Ogni progetto e' privato: lo vede e lo gestisce solo l'utente che lo ha creato.
 """
 import asyncio, io, json, math, os, re, secrets, sys, time
 from datetime import datetime, timedelta, timezone
@@ -76,7 +77,7 @@ def valid_name(n):
 class Store:
     def __init__(self, path):
         self.path, self.dirty = path, False
-        self.d = {"bots": {}, "admins": [], "audit": [], "support": {}}
+        self.d = {"bots": {}, "admins": [], "audit": [], "support": {}, "users": {}}
         if os.path.exists(path):
             with open(path, encoding="utf-8") as f: self.d.update(json.load(f))
     def save(self):
@@ -545,12 +546,27 @@ async def try_send(inter, p, channel_id, **kw):
     except RuntimeError as e: await send(inter, f"❌ {e}", ephemeral=True)
     except discord.HTTPException as e: await send(inter, f"❌ Invio non riuscito: {e}", ephemeral=True)
 
+# ----------------------------------------------------------------- traduzione dei comandi
+# Discord mostra i nomi dei comandi nella lingua dell'app dell'utente (Impostazioni > Lingua).
+# Default = italiano; client in inglese (en-US / en-GB) = nomi e descrizioni inglesi.
+EN_NAMES = {'crea-bot': 'create-bot', 'configura-bot': 'configure-bot', 'metti-online': 'go-online', 'metti-offline': 'go-offline', 'riavvia-bot': 'restart-bot', 'stato-bot': 'bot-status', 'miei-bot': 'my-bots', 'elimina-bot': 'delete-bot', 'crea-comando': 'create-command', 'lista-comandi': 'list-commands', 'modifica-comando': 'edit-command', 'duplica-comando': 'duplicate-command', 'elimina-comando': 'delete-command', 'attiva-comando': 'enable-command', 'disattiva-comando': 'disable-command', 'gestisci-comandi': 'manage-commands', 'limite-comandi': 'command-limit', 'prova-comando': 'test-command', 'importa-template': 'import-template', 'salva-configurazione': 'save-config', 'cronologia-configurazioni': 'config-history', 'esporta-configurazione': 'export-config', 'importa-configurazione': 'import-config', 'personalizza-bot': 'customize-bot', 'crea-embed': 'create-embed', 'crea-menu': 'create-menu', 'crea-pulsanti': 'create-buttons', 'attiva-modulo': 'toggle-module', 'permessi-comando': 'command-permissions', 'crea-log': 'create-log', 'configura-benvenuto': 'configure-welcome', 'configura-ticket': 'configure-ticket', 'programma-messaggio': 'schedule-message', 'statistiche-bot': 'bot-stats', 'diagnostica-bot': 'diagnose-bot', 'log-errori': 'error-log', 'supporto': 'support', 'stato-hosting': 'hosting-status', 'registro-attivita': 'activity-log', 'gestisci-accessi': 'manage-access'}
+EN_DESC = {'Crea un nuovo bot Discord con configurazione guidata': 'Create a new Discord bot with guided setup', 'Modifica le impostazioni generali di un bot': "Edit a bot's general settings", "Pubblica il bot sull'hosting BotForge e lo avvia": 'Publish the bot on BotForge hosting and start it', 'Arresta il bot senza eliminare nulla': 'Stop the bot without deleting anything', 'Riavvia il bot salvando prima la configurazione': 'Restart the bot, saving the configuration first', 'Mostra lo stato effettivo del bot': "Show the bot's actual status", 'Mostra tutti i tuoi bot': 'Show all your bots', 'Elimina un progetto dopo conferma esplicita': 'Delete a project after explicit confirmation', 'Crea un comando personalizzato senza programmare': 'Create a custom command without coding', 'Elenca i comandi del bot con ricerca e filtri': "List the bot's commands with search and filters", 'Modifica un comando esistente senza ricrearlo': 'Edit an existing command without recreating it', 'Crea una copia di un comando con un nuovo nome': 'Copy a command under a new name', 'Rimuove un comando dopo conferma': 'Remove a command after confirmation', 'Riattiva un comando disabilitato': 'Re-enable a disabled command', 'Disabilita temporaneamente un comando': 'Temporarily disable a command', 'Menu interattivo per gestire i comandi del bot': "Interactive menu to manage the bot's commands", 'Mostra quanti comandi hai creato e quanti ne restano': "Show how many commands you've created and how many are left", 'Testa un comando prima della pubblicazione': 'Test a command before publishing', 'Importa un template predefinito in un bot': 'Import a ready-made template into a bot', 'Salva una versione della configurazione': 'Save a version of the configuration', 'Mostra le versioni salvate e ripristinane una': 'Show saved versions and restore one', 'Esporta la configurazione in JSON (senza token)': 'Export the configuration as JSON (no token)', 'Importa una configurazione esportata': 'Import an exported configuration', 'Personalizza aspetto e stile delle risposte': 'Customize the look and style of replies', 'Crea e invia un embed con anteprima': 'Create and send an embed with preview', 'Crea un menu interattivo a tendina': 'Create an interactive dropdown menu', 'Crea un messaggio con pulsanti interattivi': 'Create a message with interactive buttons', 'Attiva o disattiva un gruppo di funzioni predefinite': 'Turn a group of built-in features on or off', 'Imposta chi può usare un comando': 'Set who can use a command', 'Configura il registro degli eventi del server': 'Set up the server event log', 'Imposta il messaggio di benvenuto': 'Set the welcome message', 'Configura il sistema di ticket e pubblica il pannello': 'Set up the ticket system and publish the panel', 'Pianifica un messaggio futuro': 'Schedule a future message', 'Mostra le statistiche operative': 'Show operational statistics', 'Esegue controlli sul funzionamento del bot': 'Run checks on how the bot is working', 'Mostra gli errori recenti del bot': "Show the bot's recent errors", 'Richiedi assistenza su BotForge Studio': 'Request help with BotForge Studio', 'Stato dei servizi di hosting (solo admin)': 'Hosting services status (admins only)', 'Registro delle operazioni amministrative (solo admin)': 'Log of administrative operations (admins only)', 'Assegna o revoca accessi amministrativi (solo proprietari)': 'Grant or revoke admin access (owners only)'}
+
+class BFTranslator(app_commands.Translator):
+    async def translate(self, string, locale, context):
+        if locale.value not in ("en-US", "en-GB"): return None
+        loc = context.location
+        if loc is app_commands.TranslationContextLocation.command_name: return EN_NAMES.get(string.message)
+        if loc is app_commands.TranslationContextLocation.command_description: return EN_DESC.get(string.message)
+        return None
+
 # ----------------------------------------------------------------- manager
 class Manager(discord.Client):
     def __init__(self):
         super().__init__(intents=discord.Intents.default(), allowed_mentions=NO_PINGS)
         self.tree = app_commands.CommandTree(self)
     async def setup_hook(self):
+        await self.tree.set_translator(BFTranslator())   # nomi/descrizioni in inglese per i client Discord in inglese
         if DEV_GUILD_ID:
             g = discord.Object(DEV_GUILD_ID); self.tree.copy_global_to(guild=g); await self.tree.sync(guild=g)
         else: await self.tree.sync()
@@ -569,7 +585,9 @@ class Manager(discord.Client):
     async def on_ready(self): print(f"BotForge Studio online come {self.user}")
 
 manager = Manager()
-def cmd(name, desc): return manager.tree.command(name=name, description=desc)
+def cmd(name, desc):
+    L = app_commands.locale_str   # nome e descrizione traducibili dal Translator
+    return manager.tree.command(name=L(name), description=L(desc))
 
 async def ac_bot(inter, current):
     return [app_commands.Choice(name=f"{b['name']} ({'online' if b['id'] in RUNNING else 'offline'})"[:100], value=b["id"])
@@ -1268,21 +1286,72 @@ async def log_errori(inter: discord.Interaction, bot: str):
     for x in errs: e.add_field(name=f"{ago(x['t'])} • {x['component']} • {x['command']}", value=f"{x['msg'][:200]}\n💡 {hints.get(x['component'], 'Esegui /diagnostica-bot.')}", inline=False)
     await send(inter, embed=e, ephemeral=True)  # visibile solo al proprietario (get_p)
 
-@cmd("aiuto", "Guida di BotForge Studio")
-async def aiuto(inter: discord.Interaction):
-    bots = store.mine(inter.user.id)
-    e = discord.Embed(title="📘 BotForge Studio", color=0x5865F2, description="Crea e gestisci bot Discord senza codice, interamente da Discord.")
-    if not bots: e.add_field(name="Inizia da qui", value="**/crea-bot** → crea il progetto (ti servirà il token dal Developer Portal)\nPoi: /crea-comando → /prova-comando → /metti-online")
+# ===== 6b. LINGUA E GUIDA (per utente) =====
+def lang_of(uid, locale=None):
+    """Lingua scelta con /lenguage; se non scelta, segue la lingua dell'app Discord dell'utente."""
+    saved = store.d.setdefault("users", {}).get(str(uid), {}).get("lang")
+    if saved: return saved
+    return "en" if str(getattr(locale, "value", locale or "")).startswith("en") else "it"
+
+@cmd("lenguage", "Choose your language / Scegli la tua lingua")
+@app_commands.describe(lingua="Language / Lingua")
+@app_commands.choices(lingua=[app_commands.Choice(name="English", value="en"),
+                              app_commands.Choice(name="Italiano", value="it")])
+async def lenguage(inter: discord.Interaction, lingua: str):
+    store.d.setdefault("users", {})[str(inter.user.id)] = {"lang": lingua}
+    store.save()
+    await send(inter, "✅ Language set to **English**. Try /help." if lingua == "en"
+               else "✅ Lingua impostata su **Italiano**. Prova /help.", ephemeral=True)
+
+HELP = {
+    "it": {
+        "title": "📘 BotForge Studio - Guida",
+        "desc": "Crea e gestisci bot Discord senza codice, tutto da Discord.\n🔒 **I tuoi progetti sono privati**: solo tu li vedi e li gestisci.",
+        "start": ("Inizia da qui", "**/crea-bot** → crea il progetto (serve il token dal Developer Portal)\nPoi: /crea-comando → /prova-comando → /metti-online"),
+        "next_cmds": ("Prossimo passo", "Aggiungi comandi con **/crea-comando** o **/importa-template**"),
+        "next_pub": ("Prossimo passo", "Prova con **/prova-comando**, poi **/metti-online**"),
+        "sections": [
+            ("🤖 Bot", "/crea-bot /configura-bot /metti-online /metti-offline /riavvia-bot /stato-bot /miei-bot /elimina-bot"),
+            ("⚙️ Comandi", "/crea-comando /lista-comandi /modifica-comando /duplica-comando /elimina-comando /attiva-comando /disattiva-comando /gestisci-comandi /limite-comandi /prova-comando"),
+            ("💾 Template e backup", "/importa-template /salva-configurazione /cronologia-configurazioni /esporta-configurazione /importa-configurazione"),
+            ("🎨 Aspetto", "/personalizza-bot /crea-embed /crea-menu /crea-pulsanti"),
+            ("🛡️ Moduli server", "/attiva-modulo /permessi-comando /crea-log /configura-benvenuto /configura-ticket /programma-messaggio /statistiche-bot"),
+            ("🩺 Diagnostica", "/diagnostica-bot /log-errori /supporto"),
+            ("🌍 Lingua", "/lenguage - scegli inglese o italiano (i nomi dei comandi seguono la lingua della tua app Discord)"),
+        ],
+        "footer": "Ogni bot può avere fino a {n} comandi personalizzati.",
+    },
+    "en": {
+        "title": "📘 BotForge Studio - Help",
+        "desc": "Create and manage Discord bots with no code, all inside Discord.\n🔒 **Your projects are private**: only you can see and manage them.",
+        "start": ("Start here", "**/create-bot** → create the project (you need the bot token from the Developer Portal)\nThen: /create-command → /test-command → /go-online"),
+        "next_cmds": ("Next step", "Add commands with **/create-command** or **/import-template**"),
+        "next_pub": ("Next step", "Test with **/test-command**, then **/go-online**"),
+        "sections": [
+            ("🤖 Bots", "/create-bot /configure-bot /go-online /go-offline /restart-bot /bot-status /my-bots /delete-bot"),
+            ("⚙️ Commands", "/create-command /list-commands /edit-command /duplicate-command /delete-command /enable-command /disable-command /manage-commands /command-limit /test-command"),
+            ("💾 Templates & backups", "/import-template /save-config /config-history /export-config /import-config"),
+            ("🎨 Appearance", "/customize-bot /create-embed /create-menu /create-buttons"),
+            ("🛡️ Server modules", "/toggle-module /command-permissions /create-log /configure-welcome /configure-ticket /schedule-message /bot-stats"),
+            ("🩺 Diagnostics", "/diagnose-bot /error-log /support"),
+            ("🌍 Language", "/lenguage - choose English or Italian (command names follow your Discord app language)"),
+        ],
+        "footer": "Each bot can have up to {n} custom commands.",
+    },
+}
+
+@cmd("help", "Guida di BotForge Studio / BotForge Studio guide")
+async def help_cmd(inter: discord.Interaction):
+    h = HELP[lang_of(inter.user.id, inter.locale)]
+    bots = store.mine(inter.user.id)          # SOLO i bot creati da questo utente
+    e = discord.Embed(title=h["title"], description=h["desc"], color=0x5865F2)
+    if not bots: e.add_field(name=h["start"][0], value=h["start"][1], inline=False)
     else:
-        step = "Aggiungi comandi con **/crea-comando** o **/importa-template**" if not any(b["commands"] for b in bots) else "Prova con **/prova-comando**, poi **/metti-online**"
-        e.add_field(name="Prossimo passo", value=step, inline=False)
-    e.add_field(name="Bot", value="/crea-bot /configura-bot /metti-online /metti-offline /riavvia-bot /stato-bot /miei-bot /elimina-bot", inline=False)
-    e.add_field(name="Comandi", value="/crea-comando /lista-comandi /modifica-comando /duplica-comando /elimina-comando /attiva-comando /disattiva-comando /gestisci-comandi /limite-comandi /prova-comando", inline=False)
-    e.add_field(name="Template e backup", value="/importa-template /salva-configurazione /cronologia-configurazioni /esporta-configurazione /importa-configurazione", inline=False)
-    e.add_field(name="Aspetto", value="/personalizza-bot /crea-embed /crea-menu /crea-pulsanti", inline=False)
-    e.add_field(name="Moduli server", value="/attiva-modulo /permessi-comando /crea-log /configura-benvenuto /configura-ticket /programma-messaggio /statistiche-bot", inline=False)
-    e.add_field(name="Diagnostica", value="/diagnostica-bot /log-errori /aiuto /supporto", inline=False)
-    e.set_footer(text=f"Ogni bot può avere fino a {MAX_COMMANDS} comandi personalizzati."); await send(inter, embed=e, ephemeral=True)
+        k = "next_cmds" if not any(b["commands"] for b in bots) else "next_pub"
+        e.add_field(name=h[k][0], value=h[k][1], inline=False)
+    for name, value in h["sections"]: e.add_field(name=name, value=value, inline=False)
+    e.set_footer(text=h["footer"].format(n=MAX_COMMANDS))
+    await send(inter, embed=e, ephemeral=True)   # risposta visibile solo a chi la richiede
 
 class SupportModal(discord.ui.Modal, title="Richiesta di supporto"):
     testo = discord.ui.TextInput(label="Descrivi il problema", style=discord.TextStyle.paragraph, max_length=1500)
